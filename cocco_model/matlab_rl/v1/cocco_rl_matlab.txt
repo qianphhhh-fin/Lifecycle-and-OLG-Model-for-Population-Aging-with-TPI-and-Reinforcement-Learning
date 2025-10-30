@@ -1,0 +1,1722 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+The content has been processed where security check has been disabled.
+
+================================================================
+File Summary
+================================================================
+
+Purpose:
+--------
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+
+File Format:
+------------
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  a. A separator line (================)
+  b. The file path (File: path/to/file)
+  c. Another separator line
+  d. The full contents of the file
+  e. A blank line
+
+Usage Guidelines:
+-----------------
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+
+Notes:
+------
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Security check has been disabled - content may contain sensitive information
+- Files are sorted by Git change count (files with more changes are at the bottom)
+
+
+================================================================
+Directory Structure
+================================================================
+AgentEvaluator.m
+CoccoEnv.m
+createAgentCocco.m
+evaluate_checkpoint.m
+main_nopps_sac.m
+main_nopps_vfi_benchmark.m
+NormalizedCoccoEnv.m
+RunningMeanStd.m
+test_env_rewards.m
+
+================================================================
+Files
+================================================================
+
+================
+File: AgentEvaluator.m
+================
+classdef AgentEvaluator < handle
+    % 描述:
+    % 一个用于严谨评估和对比 RL 与 VFI 策略的类 (重构版)。
+    % - 直接使用 CoccoEnv 实例进行所有模拟。
+    % - 通过重置随机数生成器种子，确保 RL 和 VFI 在相同的冲击序列下评估。
+    
+    properties
+        % --- 输入 ---
+        agent
+        stats_path
+        vfi_path
+        results_path
+        
+        % --- 模拟参数 ---
+        nsim = 50
+        env % normalizedcoccoenv包括的env
+        raw_env % 原始的env
+        
+        % --- 加载的数据 ---
+        obs_rms_data
+        vfi_policy_interp
+        
+        % --- 结果 ---
+        rl_results
+        vfi_results_sim
+        
+        % --- 状态标志 ---
+        is_rl_eval (1,1) logical
+        is_vfi_eval (1,1) logical
+        is_normalizedEnv (1,1) logical
+    end
+    
+    methods
+        % --- 构造函数 ---
+        function this = AgentEvaluator(agent, stats_path, vfi_path, results_path)
+            this.agent = agent;
+            this.agent.UseExplorationPolicy = 0; % 使用确定性策略
+            this.stats_path = stats_path;
+            this.vfi_path = vfi_path;
+            this.results_path = results_path;
+            
+            this.is_rl_eval = ~isempty(this.agent);
+            this.is_vfi_eval = ~isempty(this.vfi_path) && exist(this.vfi_path, 'file');
+            
+            if ~this.is_rl_eval && ~this.is_vfi_eval
+                error('AgentEvaluator: 无效输入', '必须提供有效的 agent 或 vfi_path。');
+            end
+            
+            % 创建一个用于评估的环境实例
+            
+          
+            % 预加载所需数据
+            if this.is_rl_eval 
+                this.load_rl_eval_env(); 
+            end
+            if this.is_vfi_eval, this.load_vfi_policies(); end
+        end
+        
+        % --- 主运行函数 ---
+        function run(this)
+            fprintf('开始评估流程...\n');
+            if this.is_rl_eval
+                this.run_rl_simulation();
+            end
+            if this.is_vfi_eval
+                this.run_vfi_simulation();
+            end
+            this.plot_results();
+        end
+
+        % --- RL 智能体模拟方法 ---
+% AgentEvaluator.m
+
+        % --- RL 智能体模拟方法 ---
+% AgentEvaluator.m
+
+        function run_rl_simulation(this)
+            fprintf('  [RL] 正在进行模拟 (与训练时评估对齐)...\n');
+            tn = this.raw_env.tn;
+            simC = zeros(tn, this.nsim); simY = zeros(tn, this.nsim);
+            simA = zeros(tn, this.nsim); simW = zeros(tn, this.nsim);
+            simC_prop = zeros(tn, this.nsim); % 增加 C_prop 记录
+            all_utilities = zeros(1, this.nsim);
+            
+            % 使用确定性策略
+            this.agent.UseExplorationPolicy = false;
+            
+            % **核心**: 重置为与VFI模拟完全相同的随机种子
+            rng(123, 'twister');
+
+            for i = 1:this.nsim
+                % **核心修改**: 模仿 trainAgentWithLivePlots 的评估循环
+                % 1. 从底层原始环境 reset，获取真实的初始状态
+                [rawObs, logged_reset] = this.raw_env.reset();
+                
+                % 2. 手动归一化初始观测值
+                normObs = this.env.normalize_obs(rawObs);
+
+                % 初始化 t=1 的财富和收入
+                W_current = logged_reset.AbsoluteWealth;
+                Y_current = logged_reset.AbsoluteIncome;
+
+                for t = 1:tn
+                    simW(t,i) = W_current;
+                    simY(t,i) = Y_current;
+
+                    % 3. 智能体使用归一化的观测值进行决策
+                    action = getAction(this.agent, {normObs});
+                    
+                    % 4. 在底层原始环境中执行动作，以获取真实的 logged_step
+                    [rawNextObs, ~, is_done, logged_step] = this.raw_env.step(action{1});
+                    
+                    % 5. 手动归一化下一个观测值，为循环的下一步做准备
+                    normObs = this.env.normalize_obs(rawNextObs);
+                    
+                    % 从 logged_step 记录结果
+                    simC(t, i) = logged_step.AbsoluteConsumption;
+                    simC_prop(t,i) = logged_step.C_prop;
+                    simA(t, i) = logged_step.RiskyShare;
+                    
+                    % 从 logged_step 更新下一期的 W 和 Y
+                    W_current = logged_step.AbsoluteWealth_next;
+                    Y_current = logged_step.AbsoluteIncome_next;
+
+                    if is_done
+                        [simC, simY, simA, simW] = this.handle_death(t, i, simC, simY, simA, simW);
+                        break;
+                    end
+                end
+                all_utilities(i) = this.calculate_lifetime_utility(simC(:, i));
+            end
+            
+            % 汇总结果
+            this.rl_results.W = nanmean(simW, 2); 
+            this.rl_results.C = nanmean(simC, 2);
+            this.rl_results.C_prop = nanmean(simC_prop, 2); % 保存 C_prop 的均值
+            this.rl_results.Y = nanmean(simY, 2); 
+            this.rl_results.A = nanmean(simA, 2);
+            this.rl_results.MeanUtility = mean(all_utilities);
+            
+            fprintf('  [RL] 模拟完成。平均终身效用: %.4f\n', this.rl_results.MeanUtility);
+
+            % 绘图部分可以暂时移到主 plot_results 函数中
+            % figure; % 创建新图窗以避免覆盖
+            % plot(this.raw_env.tb:this.raw_env.td, this.rl_results.C_prop);
+            % hold on;
+            % plot(this.raw_env.tb:this.raw_env.td, this.rl_results.A);
+            % legend({'c-prop','alpha'});
+            % title('RL Agent Policy Profile');
+            % xlabel('Age');
+            % ylabel('Action Value');
+        end       
+        
+        % --- VFI 策略模拟方法 ---
+
+        % --- VFI 策略模拟方法 ---
+        function run_vfi_simulation(this)
+            fprintf('  [VFI] 正在进行模拟 (与RL环境对齐)...\n');
+            tn = this.raw_env.tn;
+            simC = zeros(tn, this.nsim); simY = zeros(tn, this.nsim);
+            simA = zeros(tn, this.nsim); simW = zeros(tn, this.nsim);
+            simC_prop = zeros(tn, this.nsim);
+            all_utilities = zeros(1, this.nsim);
+
+            % **核心**: 重置为与RL模拟完全相同的随机种子
+            rng(123, 'twister');
+
+            for i = 1:this.nsim
+                % **核心修改**: VFI 也使用 env.reset() 来初始化
+                [~, logged_reset] = this.env.reset(); % NormObs 被忽略
+
+                % 初始化 t=1 的财富和收入
+                
+                W_current = logged_reset.AbsoluteWealth;
+                Y_current = logged_reset.AbsoluteIncome;
+                X_current = W_current + Y_current;
+                for t = 1:tn
+                    simW(t,i) = W_current;
+                    simY(t,i) = Y_current;
+
+                    % a. 使用VFI策略插值计算当前状态下的最优动作
+                    % 注意：VFI的策略函数是基于绝对现金持有量(X_t)
+                    C_vfi = this.vfi_policy_interp.c{t}(X_current);
+                    alpha_vfi = this.vfi_policy_interp.a{t}(X_current);
+                    
+                    % 将绝对消费转换为消费比例 c_prop，以作为 env.step 的输入
+                    c_prop_vfi = C_vfi / X_current;
+                    
+                    % 确保动作在 [0, 1] 区间内
+                    c_prop_vfi = max(0, min(1, c_prop_vfi));
+                    alpha_vfi  = max(0, min(1, alpha_vfi));
+
+                    % b. 将计算出的VFI动作喂给环境的step函数
+                    % 我们不关心step返回的obs和reward，只关心它如何驱动状态演化
+                    % 并记录 logged_step 中的真实数值
+                    [~, ~, is_done, logged_step] = this.env.step([c_prop_vfi, alpha_vfi]);
+                    
+                    % c. 从 logged_step 中记录结果 (这保证了与RL的绝对一致性)
+                    simC(t, i) = logged_step.AbsoluteConsumption;
+                    simC_prop(t,i) = logged_step.C_prop;
+                    simA(t, i) = logged_step.RiskyShare;
+                    
+                    % d. 从 logged_step 更新下一期的 W, Y 和 X
+                    Y_current = logged_step.AbsoluteIncome_next;
+                    W_current = logged_step.AbsoluteWealth_next;
+                    X_current = Y_current + W_current;
+
+                    if is_done
+                        [simC, simY, simA, simW] = this.handle_death(t, i, simC, simY, simA, simW);
+                        break;
+                    end
+                end
+                 all_utilities(i) = this.calculate_lifetime_utility(simC(:, i));
+            end
+            
+            % 汇总并保存结果
+            this.vfi_results_sim.W = nanmean(simW, 2); 
+            this.vfi_results_sim.C = nanmean(simC, 2);
+            this.vfi_results_sim.C_prop = nanmean(simC_prop, 2);
+            this.vfi_results_sim.Y = nanmean(simY, 2); 
+            this.vfi_results_sim.A = nanmean(simA, 2);
+            this.vfi_results_sim.MeanUtility = mean(all_utilities);
+            
+            fprintf('  [VFI] 模拟完成。平均终身效用: %.4f\n', this.vfi_results_sim.MeanUtility);
+        end        
+       
+        
+        % --- 绘图方法 (与之前版本相同) ---
+% AgentEvaluator.m
+
+        % --- 绘图方法 (重构版) ---
+        function plot_results(this)
+            fprintf('  正在生成详细的比较图表...\n');
+            
+            % --- 1. 初始化 ---
+            fig = figure('Position', [100, 100, 1400, 1000], 'Name', 'RL vs. VFI Detailed Comparison');
+            ages = this.raw_env.tb:this.raw_env.td;
+            retirement_age_line = this.raw_env.tr - 1;
+
+            % --- 3. 子图 2: 消费策略 (c_prop) ---
+            ax2 = subplot(2, 2, 1);
+            hold(ax2, 'on');
+            if this.is_rl_eval && isfield(this.rl_results, 'C_prop')
+                plot(ax2, ages, this.rl_results.C_prop, 'r--', 'LineWidth', 2, 'DisplayName', 'c-prop (RL)');
+            end
+            % VFI的c_prop需要根据其模拟结果计算: C / (W+Y)
+            if this.is_vfi_eval
+                plot(ax2, ages, this.vfi_results_sim.C_prop, 'r-', 'LineWidth', 1.5, 'DisplayName', 'c-prop (VFI)');
+            end
+            if this.is_rl_eval || this.is_vfi_eval
+                xline(ax2, retirement_age_line, '--', 'Retirement', 'LineWidth', 1.5);
+            end
+            hold(ax2, 'off');
+            title(ax2, 'c-prop');
+            xlabel(ax2, 'Age');
+            ylabel(ax2, 'Proportion of Cash-on-Hand');
+            legend(ax2, 'show', 'Location', 'best');
+            grid(ax2, 'on');
+            xlim(ax2, [ages(1), ages(end)]);
+            ylim(ax2, [-0.05, 1.05]);
+            
+            % --- 4. 子图 3: 投资策略 (alpha) ---
+            ax3 = subplot(2, 2, 2);
+            hold(ax3, 'on');
+            if this.is_rl_eval
+                plot(ax3, ages, this.rl_results.A, 'm--', 'LineWidth', 2, 'DisplayName', 'Risky Share (RL)');
+            end
+            if this.is_vfi_eval
+                plot(ax3, ages, this.vfi_results_sim.A, 'm-', 'LineWidth', 1.5, 'DisplayName', 'Risky Share (VFI)');
+            end
+            if this.is_rl_eval || this.is_vfi_eval
+                xline(ax3, retirement_age_line, '--', 'Retirement', 'LineWidth', 1.5);
+            end
+            hold(ax3, 'off');
+            title(ax3, 'Investment Policy (\alpha)');
+            xlabel(ax3, 'Age');
+            ylabel(ax3, 'Share in Risky Asset');
+            legend(ax3, 'show', 'Location', 'best');
+            grid(ax3, 'on');
+            xlim(ax3, [ages(1), ages(end)]);
+            ylim(ax3, [-0.05, 1.05]);
+
+                        % --- 2. 子图 3: 宏观变量 (财富) ---
+            ax1 = subplot(2, 2, 3);
+            hold(ax1, 'on');
+            if this.is_rl_eval
+                plot(ax1, ages, this.rl_results.W, 'b--', 'LineWidth', 2, 'DisplayName', 'Wealth (RL)');
+            end
+            if this.is_vfi_eval
+                plot(ax1, ages, this.vfi_results_sim.W, 'b-', 'LineWidth', 1.5, 'DisplayName', 'Wealth (VFI)');
+            end
+            % if this.is_rl_eval || this.is_vfi_eval
+            %     % 绘制收入曲线 (两者应几乎一致)
+            %     income_to_plot = this.rl_results.Y; % 默认使用RL的，因为两者应相同
+            %     if isempty(income_to_plot) && isfield(this.vfi_results_sim, 'Y')
+            %         income_to_plot = this.vfi_results_sim.Y;
+            %     end
+            %     plot(ax1, ages, income_to_plot, 'k:', 'LineWidth', 2, 'DisplayName', 'Income');
+            %     xline(ax1, retirement_age_line, '--', 'Retirement', 'LineWidth', 1.5);
+            % end
+            hold(ax1, 'off');
+            title(ax1, 'Mean Lifecycle Profiles (Absolute Units)');
+            xlabel(ax1, 'Age');
+            ylabel(ax1, 'Value');
+            legend(ax1, 'show', 'Location', 'northwest');
+            grid(ax1, 'on');
+            xlim(ax1, [ages(1), ages(end)]);
+
+            
+            % --- 5. 设置总标题和保存 ---
+            if this.is_rl_eval && this.is_vfi_eval, base_title = 'RL vs. VFI Solution Comparison (Identical Shocks)'; file_name = 'rl_vs_vfi_comparison_detailed.png';
+            elseif this.is_rl_eval, base_title = 'RL Agent Evaluation'; file_name = 'rl_only_evaluation_detailed.png';
+            else, base_title = 'VFI Policy Simulation'; file_name = 'vfi_only_simulation_detailed.png'; end
+            
+            utility_title = '';
+            if this.is_rl_eval, utility_title = [utility_title, sprintf('RL Utility: %.4f', this.rl_results.MeanUtility)]; end
+            if this.is_vfi_eval
+                if ~isempty(utility_title), utility_title = [utility_title, '  |  ']; end
+                utility_title = [utility_title, sprintf('VFI Utility: %.4f', this.vfi_results_sim.MeanUtility)];
+            end
+            sgtitle({base_title; utility_title}, 'FontSize', 14);
+            
+            output_filename = fullfile(this.results_path, file_name);
+            saveas(fig, output_filename);
+            fprintf('评估图表已保存到: %s\n', output_filename);
+        end
+    
+    
+    end
+    
+    methods (Access = private)
+        % --- 辅助方法 ---
+% AgentEvaluator.m
+
+        function load_rl_eval_env(this)
+            % 描述:
+            % 直接加载训练阶段结束时保存的、包含了完整归一化统计信息的
+            % NormalizedCoccoEnv 对象。
+            % **核心修改**: 不再分别加载 agent 和 stats，而是加载包含 env 的文件。
+            %              我们假设 STATS_PATH 指向的是由 env.saveStats 保存的文件。
+            
+            fprintf('  正在加载用于评估的归一化环境从: %s\n', this.stats_path);
+            
+            % STATS_PATH 文件中保存了一个名为 'eval_env' 的变量，
+            % 这个变量就是包含了统计数据的 NormalizedCoccoEnv 对象。
+            load_data = load(this.stats_path, 'eval_env');
+            this.env = load_data.eval_env;
+            this.raw_env = this.env.env; % 从封装器中获取底层的 CoccoEnv
+            
+            % 确保在评估时，环境不会再更新其统计数据
+            this.env.is_training = false;
+            
+            fprintf('  评估环境加载完成。\n');
+        end
+% AgentEvaluator.m
+
+        function load_vfi_policies(this)
+            % 描述:
+            % 加载与 RL 环境匹配的 VFI 基准策略。
+            % **核心修改**: 从 vfi_benchmark_results.mat 文件中加载策略，
+            % 并使用 cS.x_grid (绝对现金网格) 来创建插值对象。
+            
+            fprintf('  正在加载 VFI 基准策略从: %s\n', this.vfi_path);
+            
+            % 加载包含 vfi_results 和 cS 的 .mat 文件
+            data = load(this.vfi_path, 'vfi_results', 'cS');
+            vfi_results = data.vfi_results;
+            cS = data.cS;
+            
+            tn = this.raw_env.tn;
+            
+            % 确保加载的 VFI 结果与环境的时间维度匹配
+            if size(vfi_results.C_policy, 2) ~= tn
+                error('AgentEvaluator: VFI维度不匹配', ...
+                    '加载的 VFI 策略的时间维度 (%d) 与环境的时间维度 (%d) 不符。', ...
+                    size(vfi_results.C_policy, 2), tn);
+            end
+            
+            this.vfi_policy_interp.c = cell(tn, 1);
+            this.vfi_policy_interp.a = cell(tn, 1);
+            
+            % 使用绝对现金网格 cS.x_grid 创建插值
+            for t = 1:tn
+                % 创建消费策略的插值对象
+                this.vfi_policy_interp.c{t} = griddedInterpolant(cS.x_grid, vfi_results.C_policy(:,t), 'spline', 'linear');
+                
+                % 创建风险资产配置策略的插值对象
+                this.vfi_policy_interp.a{t} = griddedInterpolant(cS.x_grid, vfi_results.A_policy(:,t), 'spline', 'linear');
+            end
+            
+            fprintf('  VFI 基准策略加载并插值完成。\n');
+        end
+        
+        
+        % function normObs = normalize_obs(this, rawObs),
+        %     normObs = (rawObs - this.obs_rms_data.Mean) ./ sqrt(this.obs_rms_data.Variance + 1e-8); 
+        %     normObs(3) = rawObs(3); 
+        % end
+        function lifetime_utility = calculate_lifetime_utility(this, consumption_path)
+            utility_path = (consumption_path.^(1 - this.raw_env.gamma)) / (1 - this.raw_env.gamma)+1;
+            if this.raw_env.gamma == 1, 
+                utility_path = log(consumption_path); 
+            end
+            discount_factors = (this.raw_env.beta .^ (0:this.raw_env.tn-1))';
+            lifetime_utility = nansum(utility_path .* discount_factors);
+        end
+
+        function [C, Y, A, W] = handle_death(~, t, i, C, Y, A, W), 
+            C(t+1:end, i) = NaN; 
+            Y(t+1:end, i) = NaN; 
+            A(t+1:end, i) = NaN; 
+            W(t+1:end, i) = NaN; 
+        end
+    end
+end
+
+================
+File: CoccoEnv.m
+================
+classdef CoccoEnv < rl.env.MATLABEnvironment
+    % 描述:
+    % Cocco et al. (2005) 生命周期模型的 MATLAB 强化学习环境。
+    % **核心重构**:
+    % 1. 状态变量明确为 X_cash_on_hand，与论文保持一致。
+    % 2. 严格按照论文定义的时序和公式进行状态转移。
+
+    properties
+        % --- A. 生命周期与人口结构 ---
+        tb = 22; tr = 26; td = 30; tn = 9;
+
+        % --- B. 经济主体偏好 ---
+        beta = 0.95; gamma = 3.84;
+
+        % --- C. 收入过程参数 ---
+        aa = -2.170042 + 2.700381; b1 = 0.16818;
+        b2 = -0.0323371 / 10; b3 = 0.0019704 / 100;
+        smay = 0; smav = 0;
+
+        % --- D. 资产与回报率 ---
+        rf = 1.02; mu = 0.04;
+        sigr = 0;
+
+        % --- E. 养老金与税收 ---
+        ret_fac = 0.6827; tau_y = 0;
+
+        % --- F. 生存概率与确定性收入 ---
+        survprob; f_y;
+
+        % --- G. 离散化随机过程 ---
+        n_shocks = 5;
+        shock_grid; shock_weig; gret; yh; yp;
+
+        % --- H. 状态变量 ---
+        % **核心修正**: 状态变量从 W (财富) 改为 X (现金)
+        X_cash_on_hand (1,1) double = 0.0;
+        P (1,1) double = 0.0;
+        age (1,1) double = 22;
+        P_retirement (1,1) double = 0.0;
+
+        % --- I. 模拟控制 ---
+        disable_random_death (1,1) logical = false
+        is_done (1,1) logical = false
+    end
+
+    methods
+        % --- 构造函数 ---
+        function this = CoccoEnv(varargin)
+            % **核心修正**: 观测的第一个维度现在是 X (Cash-on-hand)
+            obsInfo = rlNumericSpec([2 1], 'LowerLimit', [0;  -1], 'UpperLimit', [inf; 1]);
+            obsInfo.Name = 'Cocco State (Cash-on-hand, P, Age)';
+            actInfo = rlNumericSpec([2 1], 'LowerLimit', [0.1; -0.1], 'UpperLimit', [1.1; 1.1]);
+            actInfo.Name = 'Cocco Action (c_prop, alpha)';
+            this@rl.env.MATLABEnvironment(obsInfo, actInfo);
+
+            p = inputParser;
+            addParameter(p, 'disable_random_death', false);
+            parse(p, varargin{:});
+            this.disable_random_death = p.Results.disable_random_death;
+
+            this.tn = this.td - this.tb + 1;
+            this.precompute_survival_and_income();
+            this.precompute_discrete_shocks();
+        end
+
+        % --- 重置函数 ---
+        function [InitialObservation, info] = reset(this)
+            this.age = this.tb;
+            this.is_done = false;
+            this.P_retirement = 0;
+
+            % 1. 初始化 P_1
+            idx_z = randsample(this.n_shocks, 1, true, this.shock_weig);
+            this.P = this.yp(idx_z);
+
+            % 2. 初始财富 W_1 = 0
+            W1 = 0;
+
+            % 3. 实现初始收入 Y_1
+            idx_u = randsample(this.n_shocks, 1, true, this.shock_weig);
+            Y1 = exp(this.f_y(1) + this.P + this.yh(idx_u));
+
+            % 4. 初始化状态变量 X_1 = W_1 + Y_1
+            this.X_cash_on_hand = W1 + Y1;
+
+            InitialObservation = this.getObs();
+            info = struct('AbsoluteIncome', Y1, 'AbsoluteWealth', W1);
+        end
+
+        % --- 步进函数 ---
+        function [NextObs, Reward, IsDone, LoggedSignal] = step(this, Action)
+            c_prop = max(0, min(1, Action(1)));
+            alpha  = max(0, min(1, Action(2)));
+            
+            % 当前状态为 (X_t, P_t, age_t)
+            current_X = this.X_cash_on_hand;
+            current_age_idx = this.age - this.tb + 1;
+
+            % 1. 智能体决策: 计算消费 C_t 和储蓄 S_t
+            C = c_prop * current_X;
+            C = min(C, current_X * 0.99999);
+            if C < 1e-6, C = 1e-6; end
+            S = current_X - C;
+
+            % 2. 计算奖励
+            utility = (C^(1 - this.gamma)) / (1 - this.gamma)+1;
+            if this.gamma == 1, utility = log(C); end
+            Reward = max(utility, -10);
+
+            % 3. 计算下一期期初财富 W_{t+1}
+            idx_r = randsample(this.n_shocks, 1, true, this.shock_weig);
+            portfolio_return = alpha * this.gret(idx_r) + (1 - alpha) * this.rf;
+            W_next = S * portfolio_return;
+
+            % 4. 演进状态 age 和 P 到 t+1
+            next_age = this.age + 1;
+            idx_z = randsample(this.n_shocks, 1, true, this.shock_weig);
+            if next_age <= this.tr
+                this.P = this.P + this.yp(idx_z);
+                if next_age == this.tr
+                    this.P_retirement = this.P;
+                end
+            end
+            this.age = next_age;
+
+            % 5. 实现下一期收入 Y_{t+1}
+            Y_next = 0;
+            idx_u = randsample(this.n_shocks, 1, true, this.shock_weig);
+            next_age_idx = this.age - this.tb + 1;
+            if this.age <= this.tr
+                Y_next = exp(this.f_y(next_age_idx) + this.P + this.yh(idx_u));
+            else
+                Y_next = this.ret_fac * exp(this.f_y(this.tr - this.tb + 1) + this.P_retirement);
+            end
+
+            % 6. 更新下一期状态：现金 X_{t+1} = W_{t+1} + Y_{t+1}
+            this.X_cash_on_hand = W_next + Y_next;
+
+            % 7. 检查终止条件
+            died = false;
+            if this.age > this.td
+                died = true;
+            elseif ~this.disable_random_death && rand() > this.survprob(current_age_idx)
+                died = true;
+            end
+            this.is_done = died;
+
+            IsDone = this.is_done;
+            NextObs = this.getObs();
+            
+            % 为日志信号计算当期收入 Y_t
+            % Y_t = X_t - W_t = X_t - S_{t-1}*R_t (这很复杂)
+            % 为了简单，我们只记录下一期的财富和收入
+            LoggedSignal = struct('C_prop', C/current_X, 'AbsoluteConsumption', C, ...
+                                'AbsoluteIncome_next', Y_next, 'AbsoluteWealth_next', W_next, ...
+                                'RiskyShare', alpha);
+        end
+
+        % --- 辅助函数: 获取当前观测 ---
+        function Obs = getObs(this)
+            normalized_age = 2 * (this.age - this.tb) / (this.td - this.tb) - 1;
+            Obs = [this.X_cash_on_hand; normalized_age];
+        end
+    end
+
+    methods (Access = private)
+        % precompute_discrete_shocks, precompute_survival_and_income, discretizeAR1_Tauchen
+        % 这三个函数保持不变，无需修改
+        function precompute_discrete_shocks(this)
+            [grid, weig_matrix] = this.discretizeAR1_Tauchen(0, 0, 1, this.n_shocks, 2);
+            this.shock_grid = grid;
+            this.shock_weig = diag(weig_matrix);
+            this.gret = this.rf + this.mu + this.shock_grid * this.sigr;
+            this.yh = this.shock_grid * this.smay;
+            this.yp = this.shock_grid * this.smav;
+        end
+        function precompute_survival_and_income(this)
+            survprob_data = [0.99975, 0.99974, 0.99973, 0.99972, 0.99971, 0.99969, 0.99968, 0.99966, 0.99963, 0.99961, 0.99958, 0.99954, 0.99951, 0.99947, 0.99943, 0.99938, 0.99934, 0.99928, 0.99922, 0.99916, 0.99908, 0.999, 0.99891, 0.99881, 0.9987, 0.99857, 0.99843, 0.99828, 0.99812, 0.99794, 0.99776, 0.99756, 0.99735, 0.99713, 0.9969, 0.99666, 0.9964, 0.99613, 0.99583, 0.99551, 0.99515, 0.99476, 0.99432, 0.99383, 0.9933, 0.9927, 0.99205, 0.99133, 0.99053, 0.98961, 0.98852, 0.98718, 0.98553, 0.98346, 0.98089, 0.97772, 0.97391, 0.96943, 0.96429, 0.95854, 0.95221, 0.94537, 0.93805, 0.93027, 0.92202, 0.91327, 0.90393, 0.89389, 0.88304, 0.87126, 0.85846, 0.84452, 0.82935, 0.81282, 0.79485, 0.77543, 0.75458, 0.7324, 0.70893, 0.68424, 0.68424, 0.68424];
+            this.survprob = ones(this.tn - 1, 1);
+            copy_len = min(length(this.survprob), length(survprob_data));
+            this.survprob(1:copy_len) = survprob_data(1:copy_len);
+            this.f_y = zeros(this.tn, 1);
+            for i = 1:this.tn
+                age_loop = this.tb + i - 1;
+                if age_loop <= this.tr
+                    this.f_y(i) = (this.aa + this.b1*age_loop + this.b2*age_loop^2 + this.b3*age_loop^3)-3;
+                end
+            end
+        end
+        function [z_grid, P] = discretizeAR1_Tauchen(~, mew, rho, sigma, znum, Tauchen_q)
+            if znum == 1, z_grid = mew / (1 - rho); P = 1; return; end
+            zstar = mew / (1 - rho);
+            sigmaz = sigma / sqrt(1 - rho^2);
+            z_grid = zstar + linspace(-Tauchen_q * sigmaz, Tauchen_q * sigmaz, znum)';
+            omega = z_grid(2) - z_grid(1);
+            P = zeros(znum, znum);
+            for i = 1:znum
+                for j = 1:znum
+                    if j == 1
+                        P(i, j) = normcdf((z_grid(j) + omega/2 - rho * z_grid(i) - mew) / sigma);
+                    elseif j == znum
+                        P(i, j) = 1 - normcdf((z_grid(j) - omega/2 - rho * z_grid(i) - mew) / sigma);
+                    else
+                        P(i, j) = normcdf((z_grid(j) + omega/2 - rho * z_grid(i) - mew) / sigma) - ...
+                            normcdf((z_grid(j) - omega/2 - rho * z_grid(i) - mew) / sigma);
+                    end
+                end
+            end
+        end
+    end
+end
+
+================
+File: createAgentCocco.m
+================
+% createAgentCocco.m
+
+function agent = createAgentCocco(obsInfo, actInfo, discountFactor, sampleTime)
+    % 描述:
+    % 创建用于Cocco环境的SAC智能体。
+    
+    % --- 通用网络设置 ---
+    statePath = [
+        featureInputLayer(obsInfo.Dimension(1), 'Normalization', 'none', 'Name', 'state')
+        fullyConnectedLayer(64, 'Name', 's_fc1')
+        reluLayer('Name', 's_relu1')
+        fullyConnectedLayer(64, 'Name', 's_fc2')
+        reluLayer('Name', 's_relu2')
+        ];
+    
+    actionPath = [
+        featureInputLayer(actInfo.Dimension(1), 'Normalization', 'none', 'Name', 'action')
+        fullyConnectedLayer(64, 'Name', 'a_fc1')
+        reluLayer('Name', 'a_relu1')
+        ];
+
+    commonPath = [
+        concatenationLayer(1, 2, 'Name', 'concat')
+        reluLayer('Name', 'c_relu1')
+        fullyConnectedLayer(1, 'Name', 'c_fc_out')
+        ];
+    
+    % --- Critic 网络 ---
+    criticNetwork = layerGraph(statePath);
+    criticNetwork = addLayers(criticNetwork, actionPath);
+    criticNetwork = addLayers(criticNetwork, commonPath);
+    criticNetwork = connectLayers(criticNetwork, 's_relu2', 'concat/in1');
+    criticNetwork = connectLayers(criticNetwork, 'a_relu1', 'concat/in2');
+
+    optimizerOpts = rlOptimizerOptions('Optimizer', 'adam', 'LearnRate', 3e-4, 'GradientThreshold', 10);
+    
+    critic1 = rlQValueFunction(criticNetwork, obsInfo, actInfo, 'ObservationInputNames', 'state', 'ActionInputNames', 'action');
+    critic2 = rlQValueFunction(criticNetwork, obsInfo, actInfo, 'ObservationInputNames', 'state', 'ActionInputNames', 'action');
+
+    % --- Actor 网络 ---
+    actorNetwork = layerGraph(statePath);
+    
+    % --- 关键修正: 移除 Sigmoid 层 ---
+    % Sigmoid 层将输出限制在 (0, 1) 开区间，无法达到边界值 0 或 1。
+    % 此外，当输出接近边界时，会引发梯度消失问题，阻碍学习。
+    % 我们让网络直接输出动作分布的均值，不加激活函数。
+    % 最终的动作由环境 step 函数中的 max/min 操作来确保在 [0, 1] 闭区间内。
+    meanPath = [
+        fullyConnectedLayer(actInfo.Dimension(1), 'Name', 'mean_fc')
+        % <--- 移除了这里的 sigmoidLayer
+        ]; 
+    
+    stdPath = [
+        fullyConnectedLayer(actInfo.Dimension(1), 'Name', 'std_fc')
+        softplusLayer('Name','softplus')
+        ];
+        
+    actorNetwork = addLayers(actorNetwork, meanPath);
+    actorNetwork = addLayers(actorNetwork, stdPath);
+    
+    actorNetwork = connectLayers(actorNetwork,'s_relu2','mean_fc');
+    actorNetwork = connectLayers(actorNetwork,'s_relu2','std_fc');
+    
+    actor = rlContinuousGaussianActor(actorNetwork, obsInfo, actInfo, ...
+        'ActionMeanOutputNames', 'mean_fc',... % <--- 输出层名字现在是 'mean_fc'
+        'ActionStandardDeviationOutputNames', 'softplus',...
+        'ObservationInputNames', 'state');
+
+    % --- 智能体选项 ---
+    agentOptions = rlSACAgentOptions(...
+        'SampleTime', sampleTime,...
+        'DiscountFactor', discountFactor,...
+        'ExperienceBufferLength', 500000,...
+        'MiniBatchSize', 256,...
+        'NumStepsToLookAhead', 1, ...
+        'TargetSmoothFactor', 5e-3);
+    
+    % 确保熵调节是开启的 (默认行为)
+    agentOptions.ActorOptimizerOptions = optimizerOpts;
+    agentOptions.CriticOptimizerOptions = optimizerOpts;
+    agentOptions.EntropyWeightOptions.EntropyWeight = 0.2;
+    % agentOptions.EntropyWeightOptions.TargetEntropy = 0;
+    
+    % --- 创建智能体 ---
+    agent = rlSACAgent(actor, [critic1; critic2], agentOptions);
+end
+
+================
+File: evaluate_checkpoint.m
+================
+%% evaluate_checkpoint.m
+% 描述:
+% 这是一个独立的评估脚本，用于加载训练阶段一过程中保存的
+% 某个特定检查点 (checkpoint)，并对其进行详细的性能评估。
+
+% --- 初始化 ---
+clear;
+close all;
+
+
+fprintf('开始评估指定的 RL 检查点...\n');
+
+% --- 1. 参数设置 ---
+
+% ** 请在这里修改为您想要评估的检查点文件路径 **
+% 路径通常是 'results_rl/p1_checkpoints/AgentK.mat'
+% 其中 K 是您想评估的 episode 编号 (例如 200, 400, ...)
+% AGENT_CHECKPOINT_PATH = 'results_rl/agent_phase1.mat'; 
+% AGENT_CHECKPOINT_PATH = 'results_rl/p1_checkpoints/Agent1200.mat'; 
+AGENT_CHECKPOINT_PATH = 'results_rl/p1_best_model/agent_phase1_best.mat'; 
+
+% 其他必要文件的路径 (通常不需要修改)
+STATS_PATH = 'results_rl/p1_best_model/stats_phase1_best.mat';
+VFI_MAT_FILE = 'result/vfi_benchmark_results.mat';
+RESULTS_SAVE_PATH = 'results_rl'; % 评估结果图的保存位置
+
+
+% --- 检查文件是否存在 ---
+if ~exist(AGENT_CHECKPOINT_PATH, 'file')
+    error('指定的智能体检查点文件 "%s" 未找到。请检查路径和文件名是否正确。', AGENT_CHECKPOINT_PATH);
+end
+if ~exist(STATS_PATH, 'file')
+    error('归一化统计数据文件 "%s" 未找到。请确保已至少成功运行一部分阶段一训练。', STATS_PATH);
+end
+% if ~exist(VFI_MAT_FILE, 'file')
+%     error('VFI结果文件 "%s" 未找到。', VFI_MAT_FILE);
+% end
+
+% --- 2. 加载智能体 ---
+fprintf('正在加载智能体检查点从: %s\n', AGENT_CHECKPOINT_PATH);
+load(AGENT_CHECKPOINT_PATH); % 检查点文件通常将智能体保存在名为 'agent' 的变量中
+
+% --- 3. 调用主评估函数 ---
+fprintf('智能体已加载，开始调用评估函数...\n');
+evaluator = AgentEvaluator(agent, STATS_PATH,VFI_MAT_FILE, RESULTS_SAVE_PATH); % 
+evaluator.run(); % 执行模拟和绘图
+
+
+% 调用我们已有的 evaluate_agent 函数进行评估
+% 它会处理所有的模拟和绘图工作
+
+fprintf('\n检查点评估完成。\n');
+
+================
+File: main_nopps_sac.m
+================
+%% main_rl_cocco.m
+% 描述:
+% 使用MATLAB强化学习工具箱 (SAC算法) 求解Cocco(2005)生命周期模型。
+% 采用两阶段课程学习策略，并实现了关键的观测/奖励归一化。
+%
+% 流程:
+% 1. 设置参数。
+% 2. 阶段一: 在无随机死亡的简化环境中进行预训练。
+% 3. 阶段二: 加载预训练模型，在有随机死亡的完整环境中进行微调。
+% 4. 评估最终模型，并与VFI结果进行对比。
+
+% --- 初始化 ---
+clear;
+close all;
+% clc;
+rng(42); % 设置随机种子以保证可复现性
+
+fprintf('开始执行 Cocco 生命周期模型的 RL 求解...\n');
+
+% --- A. 路径和参数设置 ---
+results_path = 'results_rl';
+if ~exist(results_path, 'dir'), mkdir(results_path); end
+
+% VFI_MAT_FILE = 'result/vfi_results_crra_nopps_solo.mat';
+% if ~exist(VFI_MAT_FILE, 'file')
+%     error('VFI结果文件 "%s" 未找到。请先运行 main_nopps.m。', VFI_MAT_FILE);
+% end
+
+% 训练参数
+TIMESTEPS_PHASE1 = 3000;  % 阶段一训练步数
+TIMESTEPS_PHASE2 = 1000;  % 阶段二训练步数
+AGENT_SAMPLE_TIME = 1.0;
+DISCOUNT_FACTOR = 0.95;    % 必须与环境中的 beta 匹配
+
+% 文件路径
+agent_phase1_path = fullfile(results_path, 'agent_phase1.mat');
+stats_phase1_path = fullfile(results_path, 'stats_phase1.mat');
+final_agent_path = fullfile(results_path, 'final_agent.mat');
+
+% --- B. 阶段一: 预训练 (无随机死亡) ---
+fprintf('\n===== 阶段一: 预训练 (无随机死亡) =====\n');
+
+% 1. 创建简化环境 (禁用随机死亡)
+env_p1_base = CoccoEnv('disable_random_death', true);
+
+% 2. 使用归一化封装器
+env_p1 = NormalizedCoccoEnv(env_p1_base, 'norm_obs_idx', [1]); % 只归一化财富和永久收入
+% env_p1 = env_p1_base;
+
+% 3. 创建SAC智能体
+obsInfo = getObservationInfo(env_p1);
+actInfo = getActionInfo(env_p1);
+% agent_p1 = createAgentCocco(obsInfo, actInfo, DISCOUNT_FACTOR, AGENT_SAMPLE_TIME);
+agent_p1 = createAgentCocco_sep(obsInfo, actInfo, DISCOUNT_FACTOR, AGENT_SAMPLE_TIME);
+
+% 4. 设置训练选项
+trainOpts_p1 = rlTrainingOptions(...
+    'MaxEpisodes', 30000, ...
+    'MaxStepsPerEpisode', env_p1_base.tn, ...
+    'ScoreAveragingWindowLength', 50, ...
+    'Verbose', true, ...
+    'Plots', 'training-progress', ...
+    'StopTrainingCriteria', 'AverageReward', ...
+    'StopTrainingValue', 1000, ... % 设置一个较高的值，让训练由步数决定
+    'SaveAgentCriteria', 'EpisodeFrequency',...
+    'SaveAgentValue', 50, ...
+    'SaveAgentDirectory', fullfile(results_path, 'p1_checkpoints'));
+
+% if TIMESTEPS_PHASE1 > 0
+%     % 5. 训练智能体
+%     trainingStats_p1 = train(agent_p1, env_p1, trainOpts_p1);
+% 
+%     % 6. 保存智能体和归一化统计数据
+%     save(agent_phase1_path, 'agent_p1');
+%     env_p1.saveStats(stats_phase1_path);
+% 
+%     fprintf('阶段一训练完成。智能体已保存到 %s\n', agent_phase1_path);
+%     fprintf('归一化统计数据已保存到 %s\n', stats_phase1_path);
+% 
+%     % 加载最优的智能体以进入下一阶段
+%     agentToLoad = trained_agent_p1; 
+% else
+%     fprintf('跳过阶段一训练，尝试加载已有文件...\n');
+%     load(agent_phase1_path, 'trained_agent_p1');
+%     agentToLoad = trained_agent_p1;
+% end
+
+if TIMESTEPS_PHASE1 > 0
+        % **新增**: 定义阶段一最佳模型的保存路径
+    bestModelDir = fullfile(results_path, 'p1_best_model');
+    bestAgentPath_p1 = fullfile(bestModelDir, 'agent_phase1_best.mat');
+    bestStatsPath_p1 = fullfile(bestModelDir, 'stats_phase1_best.mat');
+
+    % 5. 训练智能体 (使用我们的自定义函数)
+    trainingStats_p1 = trainAgentWithLivePlots(agent_p1, env_p1, trainOpts_p1, ...
+        bestAgentPath_p1, bestStatsPath_p1);
+
+    % 6. 保存智能体和归一化统计数据
+    % 注意：自定义循环不返回训练好的智能体，agent_p1 本身就是训练后的版本
+    save(agent_phase1_path, 'agent_p1');
+    env_p1.saveStats(stats_phase1_path);
+
+    fprintf('阶段一训练完成。智能体已保存到 %s\n', agent_phase1_path);
+    fprintf('归一化统计数据已保存到 %s\n', stats_phase1_path);
+    aaa
+    % 加载最优的智能体以进入下一阶段
+    agentToLoad = agent_p1; % 直接使用训练后的 agent_p1
+else
+    fprintf('跳过阶段一训练，尝试加载已有文件...\n');
+    load(agent_phase1_path, 'agent_p1'); % <-- 确保加载的变量名是 agent_p1
+    agentToLoad = agent_p1;
+end
+
+aaa
+% --- C. 阶段二: 微调 (有随机死亡) ---
+fprintf('\n===== 阶段二: 微调 (有随机死亡) =====\n');
+
+% 1. 创建完整环境
+env_p2_base = CoccoEnv('disable_random_death', false);
+
+% 2. 创建归一化封装器并 **加载** 阶段一的统计数据
+env_p2 = NormalizedCoccoEnv(env_p2_base, 'norm_obs_idx', [1, 2]);
+env_p2.loadStats(stats_phase1_path);
+fprintf('已成功加载阶段一的归一化统计数据。\n');
+
+% 3. 加载阶段一训练好的智能体
+agent_p2 = agentToLoad;
+
+% 4. 设置微调的训练选项 (通常使用更小的学习率，但这里为了简化保持一致)
+trainOpts_p2 = rlTrainingOptions(...
+    'MaxEpisodes', 5000, ...
+    'MaxStepsPerEpisode', env_p2_base.tn, ...
+    'ScoreAveragingWindowLength', 50, ...
+    'Verbose', true, ...
+    'Plots', 'training-progress', ...
+    'StopTrainingCriteria', 'AverageReward', ...
+    'StopTrainingValue', 1000, ...
+    'SaveAgentCriteria', 'EpisodeFrequency',...
+    'SaveAgentValue', 200, ...
+    'SaveAgentDirectory', fullfile(results_path, 'p2_checkpoints'));
+
+if TIMESTEPS_PHASE2 > 0
+    % 5. 继续训练 (微调)
+    trainingStats_p2 = train(agent_p2, env_p2, trainOpts_p2);
+    
+    % 6. 保存最终的智能体
+    final_agent = trainingStats_p2.Agent;
+    save(final_agent_path, 'final_agent');
+    fprintf('阶段二微调完成。最终智能体已保存到 %s\n', final_agent_path);
+else
+    fprintf('跳过阶段二训练。\n');
+    final_agent = agentToLoad; % 如果不进行阶段二, 则阶段一的结果就是最终结果
+    save(final_agent_path, 'final_agent');
+end
+
+% --- D. 最终评估 ---
+fprintf('\n===== 最终评估 =====\n');
+evaluate_agent(final_agent, stats_phase1_path, VFI_MAT_FILE, results_path);
+
+fprintf('\n所有流程执行完毕。\n');
+
+
+% main_nopps_sac.m (在文件末尾的函数)
+
+% main_nopps_sac.m (在文件末尾的函数)
+
+function trainingStats = trainAgentWithLivePlots(agent, env, trainOpts, bestAgentPath, bestStatsPath)
+    % 描述:
+    % 一个自定义的训练循环，用于在训练过程中实时可视化智能体的策略演变。
+    % V5: 如果原始奖励有提升，则自动保存最佳模型和统计数据。
+    %
+    % 输入:
+    %   agent - 要训练的 RL 智能体
+    %   env - 强化学习环境
+    %   trainOpts - 包含训练参数的 rlTrainingOptions 对象
+    %   bestAgentPath - 最佳智能体模型的保存路径 (string)
+    %   bestStatsPath - 最佳统计数据的保存路径 (string)
+    %
+    % 输出:
+    %   trainingStats - 包含训练统计信息（如奖励）的结构体
+
+    fprintf('开始使用自定义循环进行训练，并实时显示策略...\n');
+
+    % --- 1. 从 trainOpts 中提取参数和新配置 ---
+    maxEpisodes = trainOpts.MaxEpisodes;
+    maxStepsPerEpisode = trainOpts.MaxStepsPerEpisode;
+    scoreAvgWindow = trainOpts.ScoreAveragingWindowLength;
+    plotFrequency = 50;
+    rewardPlotWindow = 10000;
+
+    % **新增**: 创建保存最佳模型的目录 (如果不存在)
+    [bestModelDir, ~, ~] = fileparts(bestAgentPath);
+    if ~exist(bestModelDir, 'dir')
+        mkdir(bestModelDir);
+        fprintf('创建目录: %s\n', bestModelDir);
+    end
+
+    % --- 2. 初始化绘图窗口 ---
+    fig = figure('Position', [200, 200, 1200, 600], 'Name', 'RL Agent Training Monitor');
+    rewardPlotAx = subplot(1,2,1);
+    rewardPlotLine = plot(rewardPlotAx, NaN, NaN);
+    title(rewardPlotAx, 'Episode Discounted Reward (Recent 500)');
+    xlabel(rewardPlotAx, 'Episode'); ylabel(rewardPlotAx, 'Total Normalized Reward');
+    grid(rewardPlotAx, 'on');
+    policyPlotAx = subplot(1,2,2);
+    hold(policyPlotAx, 'on');
+    ages = env.env.tb : env.env.td;
+    policyPlotC = plot(policyPlotAx, ages, nan(1, maxStepsPerEpisode), 'b-', 'LineWidth', 2, 'DisplayName', 'c-prop');
+    policyPlotA = plot(policyPlotAx, ages, nan(1, maxStepsPerEpisode), 'r-', 'LineWidth', 2, 'DisplayName', 'alpha');
+    title(policyPlotAx, 'Agent Policy (Deterministic)');
+    xlabel(policyPlotAx, 'Age'); ylabel(policyPlotAx, 'Action Value');
+    legend(policyPlotAx, 'show', 'Location', 'best');
+    grid(policyPlotAx, 'on');
+    ylim(policyPlotAx, [-0.1, 1.1]); xlim(policyPlotAx, [env.env.tb, env.env.td]);
+    hold(policyPlotAx, 'off');
+
+    % --- 3. 初始化训练变量 ---
+    episodeRewards = zeros(1, maxEpisodes);
+    % **核心修改**: 新增一个数组用于存储每个 episode 的原始折现奖励 (终身效用)
+    episodeRawDiscountedRewards = zeros(1, maxEpisodes);
+    best_eval_reward_so_far = -inf; 
+    trainingStats.EpisodeReward = [];
+    totalSteps = 0;
+    tic; 
+
+    % --- 4. 主训练循环 ---
+    for iEpisode = 1:maxEpisodes
+        
+        obs = env.reset();
+        isDone = false;
+        currentEpisodeReward = 0;
+        currentEpisodeRawDiscountedReward = 0; % **核心修改**: 初始化当前 episode 的原始折现奖励
+        
+        for iStep = 1:maxStepsPerEpisode
+            actionCell = getAction(agent, {obs}); 
+            % **核心修改**: step 函数现在只返回原始奖励
+            [nextObs, rawReward, isDone, ~] = env.step(actionCell{1}); 
+            
+            experience.Observation = {obs};
+            experience.Action = actionCell;
+            experience.Reward = rawReward; % **核心修改**: 传给 agent.learn 的也是原始奖励
+            experience.NextObservation = {nextObs};
+            experience.IsDone = double(isDone);
+            
+            learn(agent, experience); 
+            
+            obs = nextObs;
+            currentEpisodeReward = currentEpisodeReward + rawReward;
+            % **核心修改**: 累加计算当前 episode 的原始折现奖励
+            currentEpisodeRawDiscountedReward = currentEpisodeRawDiscountedReward + (env.env.beta^(iStep-1)) * rawReward;
+
+            totalSteps = totalSteps + 1;
+            
+            if isDone, break; end
+        end
+        % **核心修改**: 保存两种不同的奖励值
+        episodeRewards(iEpisode) = currentEpisodeReward; % 这个是用于绘图的未折现奖励总和
+        episodeRawDiscountedRewards(iEpisode) = currentEpisodeRawDiscountedReward; % 这个是用于日志汇报的折现奖励总和
+
+        
+        % 更新绘图 (使用折现的奖励总和)
+        plotStartIdx = max(1, iEpisode - rewardPlotWindow + 1);
+        set(rewardPlotLine, 'XData', plotStartIdx:iEpisode, 'YData', episodeRawDiscountedRewards(plotStartIdx:iEpisode));
+        xlim(rewardPlotAx, [plotStartIdx-1, iEpisode+1]); 
+        
+        if mod(iEpisode, plotFrequency) == 0 || iEpisode == 1
+            agent.UseExplorationPolicy = false;
+            evalObsRaw = env.env.reset(); 
+            evalObs = env.normalize_obs(evalObsRaw);
+            isDoneEval = false;
+            c_prop_path = nan(1, maxStepsPerEpisode);
+            alpha_path = nan(1, maxStepsPerEpisode);
+            eval_reward = 0;
+            for t = 1:maxStepsPerEpisode
+                evalActionCell = getAction(agent, {evalObs});
+                [evalNextObsRaw, reward, isDoneEval, loggedStep] = env.env.step(evalActionCell{1}); % 
+                c_prop_path(t) =loggedStep.C_prop;
+                alpha_path(t) = loggedStep.RiskyShare;
+                evalObs = env.normalize_obs(evalNextObsRaw);
+                % **核心修改**: 修正了 beta 的指数
+                eval_reward = eval_reward + (env.env.beta^(t-1)) * reward; 
+                if isDoneEval, 
+                    break; 
+                end
+
+            end
+            
+
+
+            % 检查并保存最佳模型
+            if eval_reward > best_eval_reward_so_far
+                best_eval_reward_so_far = eval_reward;
+                
+                % 保存智能体
+                save(bestAgentPath, 'agent');
+                % 保存归一化统计数据
+                env.saveStats(bestStatsPath);
+                
+                fprintf('*** Episode %d: New best raw reward: %.4f! Saving model\n', ...
+                    iEpisode, best_eval_reward_so_far);
+
+                            agent.UseExplorationPolicy = true;
+            
+            set(policyPlotC, 'YData', c_prop_path);
+            set(policyPlotA, 'YData', alpha_path);
+            title(policyPlotAx, sprintf('Agent Policy (Ep: %d) | Best Raw Reward: %.2f', ...
+                iEpisode, best_eval_reward_so_far));
+            
+
+            end
+            drawnow;
+
+        end
+        
+        % 打印日志
+        if mod(iEpisode, scoreAvgWindow) == 0 && iEpisode > 0
+             % **核心修改**: 计算原始折现奖励的平均值并用于汇报
+             avgDiscountedReward = mean(episodeRawDiscountedRewards(max(1, iEpisode-scoreAvgWindow+1) : iEpisode));
+             elapsedTimeStr = datestr(toc/86400, 'HH:MM:SS');
+             fprintf('Episode: %d | Total Steps: %d | Elapsed: %s | Avg Raw Discounted Reward (last %d): %.4f\n', ...
+                 iEpisode, totalSteps, elapsedTimeStr, scoreAvgWindow, avgDiscountedReward);
+        end
+    end
+    
+    trainingStats.EpisodeReward = episodeRewards;
+    fprintf('自定义训练循环完成。总用时: %s\n', datestr(toc/86400, 'HH:MM:SS'));
+end
+
+================
+File: main_nopps_vfi_benchmark.m
+================
+%% 生命周期模型最优基准求解 (VFI in Absolute Units)
+% 描述:
+% 本脚本使用值函数迭代(VFI)求解Cocco(2005)生命周期模型的最优策略。
+% **核心特点**: 本脚本的经济环境被设计为与 `CoccoEnv.m` RL环境完全一致，
+% 以便为RL智能体的性能评估提供一个严谨、可比的“最优”基准。
+%
+% - 使用绝对单位的状态变量 (Cash-on-hand)，不进行收入归一化。
+% - 参数与 CoccoEnv.m 完全匹配。
+% - 模型为确定性版本 (无收入或回报冲击)，与RL的简化环境对应。
+%
+% 流程:
+% 1. setup_parameters_vfi: 初始化与 CoccoEnv 匹配的参数和网格。
+% 2. solve_model_vfi_abs: 使用VFI在绝对单位状态空间上逆向求解模型。
+% 3. 保存结果供 AgentEvaluator.m 使用。
+
+% --- 初始化 ---
+clear;
+close all;
+clc;
+
+% --- 主流程 ---
+fprintf('开始执行 VFI 基准求解...\n');
+
+% 1. 设置模型参数
+cS = setup_parameters_vfi();
+if ~exist(cS.save_path, 'dir'), mkdir(cS.save_path); end
+file_path = fullfile(cS.save_path, cS.save_filename);
+
+% 2. 求解模型 (如果结果文件不存在)
+if ~exist(file_path, 'file')
+    fprintf('\n===== 步骤 2: 求解模型 (VFI) =====\n');
+    vfi_results = solve_model_vfi_abs(cS);
+    save(file_path, 'vfi_results', 'cS');
+    fprintf('VFI 基准求解结果已保存到 %s\n', file_path);
+else
+    fprintf('\n已找到现有的 VFI 结果文件，跳过求解: %s\n', file_path);
+end
+
+fprintf('\nVFI 基准求解脚本执行完毕。\n');
+fprintf('现在你可以在 AgentEvaluator.m 中使用 "%s" 作为 VFI 路径进行对比评估。\n', file_path);
+
+
+%% =====================================================================
+%                       1. 参数设置函数
+%  =====================================================================
+% main_nopps_vfi_benchmark.m
+
+%% =====================================================================
+%                       1. 参数设置函数
+%  =====================================================================
+function cS = setup_parameters_vfi()
+    fprintf('===== 步骤 1: 设置与 CoccoEnv 匹配的参数 =====\n');
+    cS = struct();
+
+    % --- A. 从 CoccoEnv.m 复制的核心参数 ---
+    cS.tb = 22; cS.tr = 26; cS.td = 30;
+    cS.tn = cS.td - cS.tb + 1;
+    cS.beta = 0.95; cS.gamma = 3.84;
+    cS.rf = 1.02; cS.mu = 0.04;
+    cS.ret_fac = 0.6827; cS.tau_y = 0;
+
+    cS.sigr = 0; cS.smay = 0; cS.smav = 0;
+    
+    % --- B. 收入过程 ---
+    cS.f_y = zeros(cS.tn, 1);
+    aa = -2.170042 + 2.700381; b1 = 0.16818;
+    b2 = -0.0323371 / 10; b3 = 0.0019704 / 100;
+    for i = 1:cS.tn
+        age_loop = cS.tb + i - 1;
+        if age_loop <= cS.tr
+            cS.f_y(i) = exp(aa + b1*age_loop + b2*age_loop^2 + b3*age_loop^3 - 3);
+        end
+    end
+    
+    % --- C. 数值求解参数 ---
+    cS.nX = 100;         
+    cS.maxX = 50;        
+    % **核心修改**: 将网格的下限从 0 调整为一个很小的正数，以避免 lb > ub 的问题
+    cS.minX = 0.25;      
+    
+    cS.save_path = 'result/';
+    cS.save_filename = 'vfi_benchmark_results.mat';
+
+    % --- D. 派生参数与预计算 ---
+    % 创建非线性状态网格，现在从 minX (一个小的正数) 开始
+    % cS.x_grid = linspace(cS.minX^0.5, cS.maxX^0.5, cS.nX)'.^2;
+    
+    lgX = linspace(log(cS.minX), log(cS.maxX), cS.nX)';
+    cS.x_grid = exp(lgX);
+
+    cS.survprob = ones(cS.tn - 1, 1);
+    
+    cS.n_shocks = 1;
+    cS.shock_grid = 0; cS.shock_weig = 1;
+    cS.gret = cS.rf + cS.mu + cS.shock_grid * cS.sigr;
+    cS.yh = exp(cS.shock_grid * cS.smay);
+    
+    fprintf('参数设置完成。\n');
+end
+%% =====================================================================
+%               2. VFI 求解器函数 (绝对单位)
+%  =====================================================================
+% main_nopps_vfi_benchmark.m
+
+%% =====================================================================
+%               2. VFI 求解器函数 (绝对单位, fmincon)
+%  =====================================================================
+function results = solve_model_vfi_abs(cS)
+    % 初始化
+    V = zeros(cS.nX, cS.tn);
+    C_policy = zeros(cS.nX, cS.tn);
+    A_policy = zeros(cS.nX, cS.tn);
+
+    % --- 终端期 (t=T) ---
+    C_policy(:, cS.tn) = cS.x_grid;
+    A_policy(:, cS.tn) = 0.0; % 最后一期无储蓄
+    if cS.gamma == 1
+        V(:, cS.tn) = log(C_policy(:, cS.tn));
+    else
+        V(:, cS.tn) = (C_policy(:, cS.tn).^(1 - cS.gamma)) / (1 - cS.gamma);
+    end
+    V(C_policy(:, cS.tn) <= 0, cS.tn) = -inf; % 防止log(0)
+
+    % --- 逆向归纳求解 ---
+    % **核心修改**: 使用与 main_noPPS.m 一致的 fmincon 设置
+    options = optimoptions('fmincon', 'Display', 'off', 'Algorithm', 'interior-point', ...
+        'MaxFunctionEvaluations', 1000, 'MaxIterations', 400, ...
+        'OptimalityTolerance', 1e-10, 'StepTolerance', 1e-10, ...
+        'ConstraintTolerance', 1e-10);
+    
+    % -- 退休期 (t = T-1, ..., K) --
+    fprintf('求解退休期 (绝对单位, 使用 fmincon)...\n');
+    for t = (cS.tn-1):-1:(cS.tr - cS.tb + 1)
+        fprintf('  t = %d (年龄 %d)\n', t, t + cS.tb - 1);
+        V_next_interp = griddedInterpolant(cS.x_grid, V(:, t+1), 'spline', 'linear');
+        
+        for i_x = 1:cS.nX
+            X_t = cS.x_grid(i_x);
+            
+            % 在确定性且mu>rf-1时，最优alpha恒为1.0
+            alpha_opt = 1.0; 
+            
+            % 我们只优化消费 C
+            % 定义目标函数，只接受一个输入 C
+            obj_fun = @(C) -objective_ret(C, alpha_opt, X_t, V_next_interp, cS, t);
+            
+            % 设置优化变量 C 的边界和初始值
+            lb = 1e-6; % C > 0
+            ub = X_t;  % C <= X_t
+            if i_x > 1
+                x0 = C_policy(i_x-1, t); % 使用上一个网格点的解作为热启动
+            else
+                x0 = X_t * 0.5;
+            end
+            x0 = max(lb, min(ub, x0)); % 确保初始值在边界内
+
+            % 使用 fmincon 进行一维优化
+            [C_opt, V_opt_neg] = fmincon(obj_fun, x0, [], [], [], [], lb, ub, [], options);
+            
+            C_policy(i_x, t) = C_opt;
+            A_policy(i_x, t) = alpha_opt;
+            V(i_x, t) = -V_opt_neg;
+        end
+    end
+
+    % -- 工作期 (t = K-1, ..., 1) --
+    fprintf('求解工作期 (绝对单位, 使用 fmincon)...\n');
+    P_retirement_final = 0; 
+    for t = (cS.tr - cS.tb):-1:1
+        fprintf('  t = %d (年龄 %d)\n', t, t + cS.tb - 1);
+        V_next_interp = griddedInterpolant(cS.x_grid, V(:, t+1), 'spline', 'linear');
+        
+        for i_x = 1:cS.nX
+            X_t = cS.x_grid(i_x);
+            
+            alpha_opt = 1.0;
+            
+            obj_fun = @(C) -objective_work(C, alpha_opt, X_t, V_next_interp, cS, t);
+            
+            lb = 1e-6;
+            ub = X_t;
+            if i_x > 1
+                x0 = C_policy(i_x-1, t);
+            else
+                x0 = X_t * 0.5;
+            end
+            x0 = max(lb, min(ub, x0));
+
+            [C_opt, V_opt_neg] = fmincon(obj_fun, x0, [], [], [], [], lb, ub, [], options);
+            
+            C_policy(i_x, t) = C_opt;
+            A_policy(i_x, t) = alpha_opt;
+            V(i_x, t) = -V_opt_neg;
+        end
+        if (t + cS.tb - 1) == (cS.tr - 1), P_retirement_final = 0; end
+    end
+
+    results.V = V;
+    results.C_policy = C_policy;
+    results.A_policy = A_policy;
+    results.P_retirement_final = P_retirement_final;
+end
+function value = objective_ret(C, alpha, X_t, V_next_interp, cS, t)
+    if C <= 0 || C > X_t, value = -1e20; return; end
+    
+    % 即期效用
+    if cS.gamma == 1, u = log(C); else, u = (C.^(1 - cS.gamma)) / (1 - cS.gamma); end
+
+    % 下一期状态
+    W_next = (X_t - C) * (alpha * cS.gret + (1 - alpha) * cS.rf);
+    Y_next = cS.ret_fac * cS.f_y(cS.tr - cS.tb + 1); % 退休收入是固定的
+    X_next = W_next + Y_next;
+
+    % 期望价值 (这里是确定性的)
+    EV_next = V_next_interp(X_next);
+    
+    value = u + cS.beta * cS.survprob(t) * EV_next;
+end
+
+function value = objective_work(C, alpha, X_t, V_next_interp, cS, t)
+    if C <= 0 || C > X_t, value = -1e20; return; end
+    
+    % 即期效用
+    if cS.gamma == 1, u = log(C); else, u = (C.^(1 - cS.gamma)) / (1 - cS.gamma); end
+
+    % 下一期状态
+    W_next = (X_t - C) * (alpha * cS.gret + (1 - alpha) * cS.rf);
+    Y_next = cS.f_y(t + 1) * cS.yh; % P=1, 只有确定性增长和暂时冲击
+    X_next = W_next + Y_next;
+
+    % 期望价值 (这里是确定性的)
+    EV_next = V_next_interp(X_next);
+    
+    value = u + cS.beta * cS.survprob(t) * EV_next;
+end
+
+================
+File: NormalizedCoccoEnv.m
+================
+classdef NormalizedCoccoEnv < rl.env.MATLABEnvironment
+    % 描述:
+    % 一个环境封装器，用于对观测和奖励进行移动平均归一化。
+    % 模仿 Python stable-baselines3 中 VecNormalize 的核心功能。
+    
+    properties
+        env             % 底层的 CoccoEnv 实例
+        
+        obs_rms         % RunningMeanStd 对象用于观测
+        ret_rms         % RunningMeanStd 对象用于回报
+        
+        returns (1,1) double = 0.0 % 当前回合的累计折现回报
+        gamma   (1,1) double = 0.95 % 折现因子
+        
+        clip_obs (1,1) double = 999999
+        clip_reward (1,1) double = 999999
+        epsilon (1,1) double = 1e-8
+        
+        norm_obs_idx    % 需要归一化的观测维度索引
+        is_training (1,1) logical = true % 是否更新统计数据
+    end
+    
+    methods
+        function this = NormalizedCoccoEnv(env, varargin)
+            % 构造函数
+            p = inputParser;
+            addRequired(p, 'env');
+            addParameter(p, 'gamma', 0.95);
+            addParameter(p, 'norm_obs_idx', []);
+            parse(p, env, varargin{:});
+
+            % 继承观测和动作空间定义
+            this@rl.env.MATLABEnvironment(env.getObservationInfo(), env.getActionInfo());
+            
+            this.env = env;
+            this.gamma = p.Results.gamma;
+            this.norm_obs_idx = p.Results.norm_obs_idx;
+            
+            % 初始化 RunningMeanStd 对象
+            obs_dim = env.getObservationInfo().Dimension(1);
+            this.obs_rms = RunningMeanStd([obs_dim, 1]);
+            this.ret_rms = RunningMeanStd([1, 1]);
+        end
+        
+        function [InitialObservation, LoggedSignal] = reset(this)
+            [rawObs, LoggedSignal] = this.env.reset();
+            
+            if this.is_training
+                this.obs_rms.update(rawObs);
+            end
+            this.returns = 0;
+            
+            InitialObservation = this.normalize_obs(rawObs);
+        end
+        
+        % function [NextObs, Reward, IsDone, LoggedSignal] = step(this, Action)
+        %     [rawNextObs, rawReward, IsDone, LoggedSignal] = this.env.step(Action);
+        % 
+        %     if this.is_training
+        %         % 更新回报统计
+        %         this.returns = rawReward + this.gamma * this.returns;
+        %         this.ret_rms.update(rawReward);
+        %         if IsDone
+        %             this.returns = 0;
+        %         end
+        % 
+        %         % 更新观测统计
+        %         this.obs_rms.update(rawNextObs);
+        %     end
+        % 
+        %     NextObs = this.normalize_obs(rawNextObs);
+        %     Reward = this.normalize_reward(rawReward);
+        % end
+
+                function [NextObs, Reward, IsDone, LoggedSignal] = step(this, Action)
+            [rawNextObs, rawReward, IsDone, LoggedSignal] = this.env.step(Action);
+
+            if this.is_training
+                % **核心修正**: 
+                % 1. 移除所有关于 self.returns 和 self.ret_rms 的代码。
+                %    我们不再对奖励或回报进行归一化。
+                % 2. 只更新观测值的统计数据。
+                this.obs_rms.update(rawNextObs);
+            end
+
+            % 获取归一化后的下一个观测
+            NextObs = this.normalize_obs(rawNextObs);
+
+            % **核心修正**: 直接返回原始的、未经修改的奖励。
+            Reward = rawReward;
+        end
+        
+        function obs_norm = normalize_obs(this, obs)
+            obs_norm = (obs - this.obs_rms.Mean) ./ sqrt(this.obs_rms.Variance + this.epsilon);
+            % 对不需要归一化的维度，恢复原值
+            if ~isempty(this.norm_obs_idx)
+                all_idx = 1:length(obs);
+                unnorm_idx = setdiff(all_idx, this.norm_obs_idx);
+                obs_norm(unnorm_idx) = obs(unnorm_idx);
+            end
+            obs_norm = max(-this.clip_obs, min(this.clip_obs, obs_norm));
+        end
+
+        function obs = unnormalize_obs(this, obs_norm)
+             obs = (obs_norm .* sqrt(this.obs_rms.Variance + this.epsilon)) + this.obs_rms.Mean;
+             % 对不需要归一化的维度，恢复原值
+             if ~isempty(this.norm_obs_idx)
+                all_idx = 1:length(obs_norm);
+                unnorm_idx = setdiff(all_idx, this.norm_obs_idx);
+                obs(unnorm_idx) = obs_norm(unnorm_idx);
+            end
+        end
+        
+        function reward_norm = normalize_reward(this, reward)
+            reward_norm = reward ./ sqrt(this.ret_rms.Variance + this.epsilon);
+            reward_norm = max(-this.clip_reward, min(this.clip_reward, reward_norm));
+        end
+        
+        function saveStats(this, filepath)
+            % obs_rms_data = this.obs_rms;
+            % ret_rms_data = this.ret_rms;
+            eval_env = this;
+            save(filepath, 'eval_env');
+        end
+        
+        function loadStats(this, filepath)
+            data = load(filepath);
+            this.obs_rms = data.obs_rms_data;
+            this.ret_rms = data.ret_rms_data;
+        end
+    end
+end
+
+================
+File: RunningMeanStd.m
+================
+classdef RunningMeanStd < handle
+    % 描述:
+    % 使用 Welford's online algorithm 实现移动平均值和方差的计算。
+    % https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Welford's_online_algorithm
+    
+    properties
+        Mean
+        Variance
+        Count
+        Shape
+    end
+    
+    methods
+        function this = RunningMeanStd(shape)
+            if nargin > 0 && ~isempty(shape)
+                this.Shape = shape;
+                this.Mean = zeros(shape);
+                this.Variance = ones(shape);
+                this.Count = 1e-4; % 避免除零
+            else
+                this.Shape = [];
+                this.Mean = 0;
+                this.Variance = 1;
+                this.Count = 1e-4;
+            end
+        end
+        
+        function update(this, x)
+            batch_mean = mean(x, ndims(x));
+            batch_var = var(x, 0, ndims(x));
+            batch_count = size(x, ndims(x));
+            
+            this.update_from_moments(batch_mean, batch_var, batch_count);
+        end
+        
+        function update_from_moments(this, batch_mean, batch_var, batch_count)
+            delta = batch_mean - this.Mean;
+            tot_count = this.Count + batch_count;
+            
+            new_mean = this.Mean + delta .* batch_count ./ tot_count;
+            m_a = this.Variance .* this.Count;
+            m_b = batch_var .* batch_count;
+            M2 = m_a + m_b + (delta.^2) .* this.Count .* batch_count ./ tot_count;
+            new_var = M2 ./ tot_count;
+            
+            this.Mean = new_mean;
+            this.Variance = new_var;
+            this.Count = tot_count;
+        end
+    end
+end
+
+================
+File: test_env_rewards.m
+================
+%% test_env_rewards.m
+% 描述:
+% 这是一个用于测试 CoccoEnv 环境奖励分布的独立脚本。
+% 它通过执行一个完全随机的策略来模拟一个未经训练的智能体，
+% 并分析其获得的单步奖励（效用）的分布。
+%
+% 目的:
+% 1. 检查奖励是否存在极端的负值，这可能阻碍学习。
+% 2. 了解奖励的尺度和方差，为RL训练的稳定性提供参考。
+% 3. 验证环境在随机输入下的行为是否符合经济学直觉。
+
+% --- 初始化 ---
+clear;
+close all;
+clc;
+rng('default'); % 使用默认随机种子
+
+fprintf('开始测试 CoccoEnv 的奖励分布...\n');
+
+% --- 1. 参数设置 ---
+N_EPISODES = 2000; % 要模拟的生命周期数量
+DISABLE_DEATH = true; % 在有随机死亡的真实环境中测试
+
+% --- 2. 创建环境实例 ---
+env = CoccoEnv('disable_random_death', DISABLE_DEATH);
+tn = env.tn;
+% env = NormalizedCoccoEnv(env, 'norm_obs_idx', [1]); % 只归一化财富和永久收入
+actInfo = getActionInfo(env);
+low = actInfo.LowerLimit;
+low(1)=0.4;
+high = actInfo.UpperLimit;
+
+% --- 3. 运行模拟并收集奖励 ---
+all_rewards = []; % 用于存储所有时间步的奖励
+fprintf('正在使用随机策略模拟 %d 个生命周期...\n', N_EPISODES);
+
+h = waitbar(0, '正在模拟...');
+Y = ones(N_EPISODES,tn-1);
+for i_episode = 1:N_EPISODES
+    % 重置环境
+    [obs,info] = env.reset();
+    is_done = false;
+    ii=1;
+    Y(i_episode,ii) = info.AbsoluteIncome;
+    W(i_episode,ii) = obs(1);
+    P(i_episode,ii) = obs(2);
+    while ~is_done
+        % a. 生成一个完全随机的动作
+        % 动作是 [消费比例, 风险资产比例]
+        random_action = low + rand(size(low)) .* (high - low);
+        
+        % b. 在环境中执行动作
+        [obs, reward, is_done, info] = env.step(random_action);
+        
+        % c. 存储奖励值
+        all_rewards(end+1) = reward;
+        ii = ii + 1;
+        Y(i_episode,ii) = info.AbsoluteIncome_next;
+        W(i_episode,ii) = obs(1);
+        P(i_episode,ii) = obs(2);
+    end
+    ii=0;
+    waitbar(i_episode / N_EPISODES, h);
+end
+close(h);
+
+fprintf('模拟完成，共收集到 %d 个单步奖励。\n', length(all_rewards));
+
+% --- 4. 分析与可视化奖励分布 ---
+
+% a. 计算描述性统计量
+mean_reward = mean(all_rewards);
+std_reward = std(all_rewards);
+min_reward = min(all_rewards);
+max_reward = max(all_rewards);
+median_reward = median(all_rewards);
+percentile_1 = prctile(all_rewards, 1);  % 1%分位数
+percentile_99 = prctile(all_rewards, 99);% 99%分位数
+
+fprintf('\n--- 奖励分布统计 ---\n');
+fprintf('均值 (Mean):      %.4f\n', mean_reward);
+fprintf('标准差 (Std Dev): %.4f\n', std_reward);
+fprintf('最小值 (Min):       %.4f\n', min_reward);
+fprintf('最大值 (Max):       %.4f\n', max_reward);
+fprintf('中位数 (Median):    %.4f\n', median_reward);
+fprintf('1%% 分位数:        %.4f\n', percentile_1);
+fprintf('99%% 分位数:       %.4f\n', percentile_99);
+fprintf('-----------------------\n');
+
+% b. 绘制直方图
+figure('Position', [200, 200, 1000, 600]);
+histogram(all_rewards, 100, 'Normalization', 'pdf');
+hold on;
+
+% 绘制均值和中位数的垂直线
+xline(mean_reward, 'r--', 'LineWidth', 2, 'DisplayName', sprintf('Mean: %.2f', mean_reward));
+xline(median_reward, 'g-', 'LineWidth', 2, 'DisplayName', sprintf('Median: %.2f', median_reward));
+
+title('CoccoEnv: 单步奖励 (效用) 分布 (随机策略)');
+xlabel('奖励值 (Utility)');
+ylabel('概率密度');
+legend('show');
+grid on;
+set(gca, 'YScale', 'log'); % 使用对数刻度以便更好地观察尾部
+xlim([percentile_1 * 1.1, percentile_99 * 0.9]); % 限制X轴范围以关注核心分布
+
+fprintf('\n测试完成。请查看生成的图表。\n');
+
+
+
+
+
+================================================================
+End of Codebase
+================================================================
