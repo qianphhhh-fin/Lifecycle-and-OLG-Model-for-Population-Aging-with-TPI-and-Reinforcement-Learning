@@ -1,0 +1,140 @@
+% =========================================================================
+% == SCRIPT: test_perfect_ss_het.m
+% == 版本: [v1.0 - 异质性黄金标准生成]
+% ==
+% == 目的:
+% ==   1. 创建两个内部完全自洽的异质性稳态 (ss0_perfect, ssF_perfect)。
+% ==   2. 模拟一个从低缴费率(ss0)到高缴费率(ssF)的政策冲击。
+% ==   3. 确保两个稳态之间的人口结构、生存率等都是理论上一致的。
+% ==   4. 保存所有数据，为 test_perfect_trans_het.m 提供干净的输入。
+% =========================================================================
+clear; close all; clear classes;
+addpath(pwd); 
+fprintf('=== 异质性模型理想化环境稳态求解脚本 (v1.0) ===\n\n');
+
+%% --- 1. 全局设置 ---
+output_data_filename = 'SS/data_for_perfect_het_transition.mat';
+report_file_initial = 'SS/SS0_perfect_het_report.txt';
+report_file_final = 'SS/SSF_perfect_het_report.txt';
+
+fprintf('   加载模型物理参数...\n');
+cS = utils.ParameterValues();
+
+% 禁用PPS以简化问题
+cS.pps_active = false;
+cS.nkpps = 1;
+cS.nk = 50;
+% --- [!!! 核心异质性设定 !!!] ---
+cS.num_hh_types = 4;
+nH = cS.num_hh_types;
+
+%% --- 2. 构建理想化的宏观与人口环境 ---
+fprintf('\n--- 2. 构建理想化的宏观与人口环境 ---\n');
+% 这些参数在 ss0 和 ssF 之间保持不变
+cS_common = cS; 
+cS_common.g_A_ss = 0.015;
+cS_common.n_ss = 0.01; % 设定一个统一的、不变的人口年增长率
+fprintf('   [核心设定] 理想环境的人口年增长率 n_ss 被强制设为: %.4f\n', cS_common.n_ss);
+
+% 使用最后一年（稳态）的生存率数据作为统一生存率
+s_pathV_ss = cS_common.s_pathV(:, end);
+cS_common.s_pathV = s_pathV_ss;
+
+% 根据生存率和增长率，计算一个完全自洽的理论稳态人口分布
+Z_theory = population.compute_theoretical_ss_dist(cS_common.s_pathV, cS_common.n_ss, cS_common.time_Step, cS_common.aD_new);
+% 将其扩展到异质性维度
+Z_theory_h = Z_theory * cS_common.type_weights'; % [aD x 1] * [1 x nH] -> [aD x nH]
+fprintf('   ✅ 已根据 n_ss 和 s_pathV 计算出通用的理论人口分布 Z_theory_h。\n');
+
+% 通用的劳动过程参数
+paramS_common = struct();
+[paramS_common.leGridV, paramS_common.TrProbM_by_age, paramS_common.leProb1V, cS_common.nw_expanded] = utils.EarningProcess_AgeDependent(cS_common);
+
+%% --- 3. 求解初始完美稳态 (ss0_perfect) ---
+fprintf('\n\n--- 3. 求解初始完美稳态 (ss0_perfect) ---\n');
+cS0 = cS_common;
+% [政策设定] 初始稳态使用较低的养老金缴费率
+theta_low = 0.12;
+cS0.theta_path_h = repmat(theta_low, cS0.nTypes, 1);
+fprintf('   [政策设定] ss0 的所有类型theta统一设为: %.2f\n', theta_low);
+cS0 = utils.generateGrids(cS0);
+
+params_for_ss0 = struct(...
+    'Z', Z_theory_h, ...
+    'A', 1.0, ...
+    'g_A_ss', cS0.g_A_ss, ...
+    'n_ss', cS0.n_ss);
+
+tic;
+fprintf('   ⚙️  启动稳态求解器 (求解 ss0)...\n');
+[ss0_perfect, dist0_perfect_h, pol0_perfect_h, ~] = SS.solve_steady_state(cS0, paramS_common, params_for_ss0, true, true);
+toc;
+if isempty(ss0_perfect), error('初始稳态(ss0)求解失败！'); end
+SS.display_national_accounts(ss0_perfect, cS0, paramS_common, Z_theory_h, report_file_initial, true, true);
+
+
+%% --- 4. 求解终期完美稳态 (ssF_perfect) ---
+fprintf('\n\n--- 4. 求解终期完美稳态 (ssF_perfect) ---\n');
+cSF = cS_common;
+% [政策设定] 终期稳态使用较高的养老金缴费率
+theta_high = 0.12;
+cSF.theta_path_h = repmat(theta_high, cSF.nTypes, 1);
+fprintf('   [政策设定] ssF 的所有类型theta统一设为: %.2f\n', theta_high);
+cSF = utils.generateGrids(cSF); % 网格上限可能需要调整，这里暂时用默认
+
+params_for_ssF = struct(...
+    'Z', Z_theory_h, ...
+    'A', 1.0, ...
+    'g_A_ss', cSF.g_A_ss, ...
+    'n_ss', cSF.n_ss);
+
+tic;
+fprintf('   ⚙️  启动稳态求解器 (求解 ssF)...\n');
+[ssF_perfect, distF_perfect_h, polF_perfect_h, valF_perfect_h] = SS.solve_steady_state(cSF, paramS_common, params_for_ssF, true, true);
+toc;
+if isempty(ssF_perfect), error('终期稳态(ssF)求解失败！'); end
+SS.display_national_accounts(ssF_perfect, cSF, paramS_common, Z_theory_h, report_file_final, true, true);
+
+%% --- 5. 保存所有必要数据到 .mat 文件 ---
+fprintf('\n\n--- 5. 保存结果用于完美转轨测试 ---\n');
+
+% 构建一个在转轨期间保持不变的 cS 结构体
+cS_for_trans = cSF; % 以终期为基础
+cS_for_trans.s_pathV = repmat(cS_common.s_pathV, 1, 200); % 假设转轨200期，生存率不变
+% [核心] 构建缴费率的转轨路径：从theta_low线性过渡到theta_high
+T_trans = 100; % 设定一个转轨时长
+theta_path_trans = linspace(theta_low, theta_high, T_trans);
+cS_for_trans.theta_path_h = repmat(theta_path_trans, cS_for_trans.nTypes, 1);
+cS_for_trans.T_sim = T_trans;
+
+% [!!! 核心修正 !!!] 构建理论上完美的转轨人口路径
+initial_total_pop = 1.0; % 设定一个标准化的初始总人口
+g_n_period = (1 + cS_common.n_ss)^cS_common.time_Step - 1;
+pop_path_factors = (1 + g_n_period) .^ (0:(T_trans-1));
+% 人口路径 = (归一化的年龄分布 * 初始总人口) .* 每一期的增长因子
+Z_path_raw_perfect = (Z_theory * initial_total_pop) .* pop_path_factors; 
+cS_for_trans.Z_path_raw = Z_path_raw_perfect;
+
+
+% [!!! 核心修正 !!!] 构建理论上完美的转轨人口路径
+initial_A = 1.0; % 设定一个标准化的初始总人口
+g_a_period = (1 + cS_common.g_A_ss)^cS_common.time_Step - 1;
+g_path_factors = (1 + g_a_period) .^ (0:(T_trans-1));
+% 人口路径 = (归一化的年龄分布 * 初始总人口) .* 每一期的增长因子
+A_path_raw_perfect = (initial_A) .* g_path_factors; 
+cS_for_trans.A_path = A_path_raw_perfect;
+
+
+data_for_perfect_transition = struct();
+data_for_perfect_transition.ss0=ss0_perfect;
+data_for_perfect_transition.ssF=ssF_perfect;
+data_for_perfect_transition.dist0_h=dist0_perfect_h;
+data_for_perfect_transition.valF_h=valF_perfect_h;
+data_for_perfect_transition.polF_h=polF_perfect_h;
+data_for_perfect_transition.cS=cS_for_trans;
+data_for_perfect_transition.paramSF=paramS_common;
+
+save(output_data_filename, 'data_for_perfect_transition', '-v7.3');
+fprintf('✅ 所有完美转轨所需的数据已成功保存至: %s\n', output_data_filename);
+
+fprintf('\n--- 理想化环境稳态求解脚本执行完毕 ---\n');
