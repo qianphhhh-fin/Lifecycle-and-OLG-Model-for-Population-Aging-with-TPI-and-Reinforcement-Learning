@@ -1,0 +1,361 @@
+from typing import Callable
+import json
+import gymnasium as gym
+import numpy as np
+import os
+# from stable_baselines3 import DDPG
+# from stable_baselines3 import TD3
+# from stable_baselines3 import PPO
+# from stable_baselines3 import SAC
+from sbx import DDPG, DQN, PPO, SAC, TD3, TQC, CrossQ
+from utils.env_util import make_vec_env
+from stable_baselines3.common.vec_env import VecNormalize
+from gymnasium.envs.registration import register
+import pandas as pd
+import matplotlib.pyplot as plt
+import os
+os.environ['KMP_DUPLICATE_LIB_OK']='True'
+# get current directory of the current .ipynb 
+cdir = os.path.abspath('.') # 获取当前目录
+pardir = os.path.abspath(os.path.join(os.getcwd(), "../")) # 获取上级目录
+dbdir = os.path.abspath(os.path.join(os.getcwd(), "../..")) # 获取上上级目录(为了读取美股数据库数据)
+
+
+# import torch 
+# torch.autograd.set_detect_anomaly(True)
+import warnings
+warnings.filterwarnings('ignore')
+
+
+import sys
+cdir = os.path.abspath('.') # 获取当前目录
+# print(sys.path)
+# 状态空间：现金余额，个人养老金账户余额，永久收入冲击，年龄
+register(
+    id='pensionfund-v2',                                # call it whatever you want
+    entry_point='v2_pensionfund:PensionFundEnv', # module_name:class_name
+)
+log_dir = 'models//sac'
+
+eval_dir = 'eval//'
+# model_name = ['v13_pensionfund_penlim0_run7',
+#               'v13_pensionfund_penlim1p2_run15',
+#               'v13_pensionfund_nopenlim_run7'
+#               ]
+rl_model_name = [
+    # 'pensionfund-v2_run22//best_model_589',
+        'pensionfund-v2_run29//best_model_443',
+              ]
+# model_name = [d for d in os.listdir(log_dir) if os.path.isdir(os.path.join(log_dir, d))]
+eval_episodes = 200
+eval_seed =  3687851522
+distf = 0.95
+
+import multiprocessing as mp
+from functools import partial
+
+def evaluate_model_naive(eval_episodes=10000, eval_seed=3687851522):
+    # 读取cocco模型的A,C,V,gcash
+    current_path = os.path.dirname(os.path.abspath(__file__))
+    df_A = pd.read_excel(os.path.join(current_path,'result_cocco_matlab','A.xlsx'),header=None)
+    df_C = pd.read_excel(os.path.join(current_path,'result_cocco_matlab','C.xlsx'),header=None) 
+    df_V = pd.read_excel(os.path.join(current_path,'result_cocco_matlab','V.xlsx'),header=None)  
+    df_gcash = pd.read_excel(os.path.join(current_path,'result_cocco_matlab','gcash.xlsx'),header=None)
+    # 转换为numpy数组
+    A = df_A.to_numpy()
+    C = df_C.to_numpy()
+    V = df_V.to_numpy()
+    gcash = df_gcash.to_numpy().squeeze()
+
+
+    params = {'pension_limit': 1.2}
+
+    env = make_vec_env("pensionfund-v2",seed=1, n_envs=1,  env_kwargs={'params': params})
+    
+    action_set = []
+    score_history = []
+    age = []
+    income = []
+    consum = []
+    tmp_income = []
+    temp_consum = []
+    
+    reward_history = []
+
+    # from tqdm import tqdm
+    pbar = tqdm(total=eval_episodes, desc=f'dp模拟进度')
+    
+    for episode in range(eval_episodes):     
+        pbar.update(1)
+        env.seed(seed=eval_seed+episode)
+        obs = env.reset()   
+        info = env.reset_infos
+        done = False
+        score = 0
+        episode_actions = []
+        temp_reward = []
+        while not done:
+            # 根据state[0]获取现金
+            normalized_cash = np.squeeze(info[0]['normalized_cash']) # 归一化的现金
+            cash = obs[0][0]  # 现金
+            age_loc =  int(obs[0][-1]) - env.get_attr('tb')[0] # 获取年龄
+
+            # 根据现金和年龄插值从A中获取action
+            action = np.array([np.interp(normalized_cash, gcash, C[:, age_loc]),
+                               np.interp(normalized_cash, gcash, A[:, age_loc]),
+                               0,0])
+            if age_loc == np.shape(C)[1]-1: # 如果到达最后一期,则固定消费比例为1（全部消费干净）
+                action[0] = normalized_cash
+            else:
+                action[0] = np.clip(action[0],0,normalized_cash)
+            # action[0] = action[0]/cash # 转换为消费比例
+            action[0] = action[0]/(normalized_cash) # 消费比例           
+            action[1] = np.clip(action[1],0,1) # 风险资产比例
+
+
+
+            obs, reward, done, info = env.step(np.array([action]))
+            score += reward * (distf ** len(episode_actions))
+
+            episode_actions.append(action)
+            temp_consum.append(cash*action[0])
+            temp_reward.append(reward[0])
+            if info[0]['status']=='working':
+                tmp_income.append(info[0]['basic_income'])
+
+        age.append(info[0]['state'][-1])
+        score_history.append(score[0])
+        action_set.append(episode_actions)
+        reward_history.append(temp_reward)
+        consum.append(temp_consum)
+        income.append(np.mean(tmp_income))
+
+        tmp_income = []
+        temp_consum = []
+
+
+    life_path_detailed = pd.DataFrame({
+        '死亡年龄': age,
+        '工作期平均收入(万)': income,
+        '终身效用': score_history,
+    })
+    # 保存评估文件
+    # 从模型名中提取标识符（第二个_之后的字符串）
+    model_identifier = 'naive'
+
+    os.makedirs(eval_dir + model_identifier + '//', exist_ok=True)
+
+
+    max_length = max(len(path) for path in consum)
+    consum_path_array = np.full((eval_episodes, max_length), np.nan)
+    for i, path in enumerate(consum):
+        consum_path_array[i, :len(path)] = path
+    age_array = np.arange(env.get_attr('tb')[0], env.get_attr('tb')[0] + max_length)
+    full_consum_path = np.column_stack((age_array, consum_path_array.T))
+    consum_path_df = pd.DataFrame(full_consum_path,
+                                    columns=['年龄'] + [f'个体{i+1}' for i in range(eval_episodes)])
+    consum_path_df.to_excel(eval_dir+ model_identifier + "//" + model_identifier + "_consum_path.xlsx", index=False)
+
+    life_summary = np.array([
+        np.mean(age),
+        np.mean(income),
+        np.mean(score_history),
+        np.std(score_history),
+    ])
+
+    life_path_detailed_path = eval_dir+ model_identifier + "//" + model_identifier + "_life_path_detailed.xlsx"
+    life_path_detailed.to_excel(life_path_detailed_path, index=False)
+
+    life_summary_df = pd.DataFrame([life_summary], 
+                                columns=['死亡年龄', '工作期平均收入(万)', '终身效用','终身效用标准差'])
+    life_summary_path = eval_dir+ model_identifier + "//" + model_identifier + "_life_summary.xlsx"
+    life_summary_df.to_excel(life_summary_path, index=False)
+
+    reward_history_array = np.full((eval_episodes, max_length), np.nan)
+    for i, path in enumerate(reward_history):
+        reward_history_array[i, :len(path)] = path
+    full_reward_history = np.column_stack((age_array, reward_history_array.T))
+    reward_history_df = pd.DataFrame(full_reward_history,
+                                    columns=['年龄'] + [f'个体{i+1}' for i in range(eval_episodes)])
+    reward_history_df.to_excel(eval_dir+ model_identifier + "//" + model_identifier + "_reward_history.xlsx", index=False)
+
+    unique_age = np.arange(env.get_attr('tb')[0], env.get_attr('td')[0] + 1)[:max_length]
+    max_length = max(len(arr) for arr in action_set)
+    num_action = np.shape(action_set[0])[1]
+    aligned_actions = np.full((max_length, num_action, eval_episodes), np.nan)
+    for i, actions in enumerate(action_set):
+        aligned_actions[:len(actions), :, i] = actions
+
+    mean_action_by_age = np.nanmean(aligned_actions, axis=2)
+    mean_actions = np.column_stack((unique_age, mean_action_by_age))
+    mean_actions_df = pd.DataFrame(mean_actions, 
+                                    columns=['年龄', '消费', '风险资产','个人养老金购买比例','个人养老金风险资产比例'])
+    mean_actions_path = eval_dir+ model_identifier + "//" + model_identifier + "_mean_actions.xlsx"
+    mean_actions_df.to_excel(mean_actions_path, index=False)
+
+
+  
+    # 在life_summary_df前面插入模型标识符列
+    life_summary_df.insert(0, '模型', model_identifier)
+    return life_summary_df
+
+    
+
+def evaluate_model_rl(idx, eval_episodes=1000, eval_seed=3687851522):
+    current_path = os.path.dirname(os.path.abspath(__file__))    
+    with open(os.path.join(current_path, log_dir, idx.split('//')[0]) +"//params.json", 'r') as file:
+        params = json.load(file)   
+     
+    env = make_vec_env("pensionfund-v2",seed=1, n_envs=1, env_kwargs={'params': params})
+    env = VecNormalize.load(os.path.join(current_path, log_dir,idx.split('//')[0]) + "//vec_env.pkl", env)
+    model = SAC.load(os.path.join(current_path, log_dir, idx), env=env)
+
+    
+
+    # env = make_vec_env("pensionfund-v1",seed=eval_seed, n_envs=1, env_kwargs={'params': None})
+    
+    # env = VecNormalize.load(os.path.join(current_path, log_dir, idx) + "//eval_env.pkl",env)
+    env = make_vec_env("pensionfund-v2",seed=eval_seed, n_envs=1, env_kwargs={'params':None},\
+                            monitor_kwargs={'discount_factor': distf})         
+    env = VecNormalize(env, norm_obs=False, norm_reward=False) # 评估不需要norm_obs
+
+
+    idx = idx.split('//')[0]
+    # model = DDPG.load(os.path.join(log_dir, idx) + "//latest_model", env)
+
+    action_set = []
+    score_history = []
+    age = []
+    income = []
+    consum = []
+    tmp_income = []
+    temp_consum = []
+    reward_history = []
+    # from tqdm import tqdm
+    pbar = tqdm(total=eval_episodes, desc=f'模拟进度 {idx}')
+    
+    for episode in range(eval_episodes):       
+        pbar.update(1)
+        env.seed(seed=eval_seed+episode)
+        obs = env.reset()    
+        done = False
+        score = 0
+        episode_actions = []
+        temp_reward = []
+        while not done:
+            action, _ = model.predict(model.env.normalize_obs(obs), deterministic=True) 
+            cash = obs[0][0] #
+
+            obs, reward, done, info = env.step(action)               
+            # reward = -(((cash*action[0][0]))**(1-env.get_attr('gamma')[0]))*10 + 10       
+            score += reward * (distf ** len(episode_actions))
+            episode_actions.append(info[0]['real_actions'])
+            temp_consum.append(cash*action[0][0])
+            temp_reward.append(reward[0])
+            if info[0]['status']=='working':
+                tmp_income.append(info[0]['basic_income'])
+        
+        score_history.append(score)
+        reward_history.append(temp_reward)
+        action_set.append(episode_actions)
+        # norm_age = info[0]['state'][4]
+        # age.append(np.round((norm_age + 1) * (params['max_age'] - params['born_age']) / 2 + params['born_age'], 1) - 1)
+        age.append(env.get_attr('age')[0])
+
+        consum.append(temp_consum)
+        income.append(np.mean(tmp_income))
+
+        tmp_income = []
+        temp_consum = []
+
+
+    life_path_detailed = pd.DataFrame({
+        '死亡年龄': age,
+        '工作期平均收入(万)': income,
+        '终身效用': score_history,
+    })
+    # 保存评估文件
+    # 从模型名中提取标识符（第二个_之后的字符串）
+    model_identifier = 'rl_' + idx.split('-', 1)[1] 
+
+    os.makedirs(eval_dir + model_identifier + '//', exist_ok=True)
+
+
+    max_length = max(len(path) for path in consum)
+    consum_path_array = np.full((eval_episodes, max_length), np.nan)
+    for i, path in enumerate(consum):
+        consum_path_array[i, :len(path)] = path
+    age_array = np.arange(env.get_attr('tb')[0], env.get_attr('tb')[0] + max_length)
+    full_consum_path = np.column_stack((age_array, consum_path_array.T))
+    consum_path_df = pd.DataFrame(full_consum_path,
+                                    columns=['年龄'] + [f'个体{i+1}' for i in range(eval_episodes)])
+    consum_path_df.to_excel(eval_dir+ model_identifier + "//" + model_identifier + "_consum_path.xlsx", index=False)
+
+    reward_history_array = np.full((eval_episodes, max_length), np.nan)
+    for i, path in enumerate(reward_history):
+        reward_history_array[i, :len(path)] = path
+    full_reward_history = np.column_stack((age_array, reward_history_array.T))
+    reward_history_df = pd.DataFrame(full_reward_history,
+                                    columns=['年龄'] + [f'个体{i+1}' for i in range(eval_episodes)])
+    reward_history_df.to_excel(eval_dir+ model_identifier + "//" + model_identifier + "_reward_history.xlsx", index=False)
+
+    life_summary = np.array([
+        np.mean(age),
+        np.mean(income),
+        np.mean(score_history),
+        np.std(score_history),
+    ])
+
+    life_path_detailed_path = eval_dir+ model_identifier + "//" + model_identifier + "_life_path_detailed.xlsx"
+    life_path_detailed.to_excel(life_path_detailed_path, index=False)
+
+    life_summary_df = pd.DataFrame([life_summary], 
+                                columns=[ '死亡年龄', '工作期平均收入(万)','终身效用','终身效用标准差'])
+    life_summary_path = eval_dir+ model_identifier + "//" + model_identifier + "_life_summary.xlsx"
+    life_summary_df.to_excel(life_summary_path, index=False)
+
+
+
+    unique_age = np.arange(env.get_attr('tb')[0], env.get_attr('td')[0] + 1)[:max_length]
+    max_length = max(len(arr) for arr in action_set)
+    num_action = np.shape(action_set[0])[1]
+    aligned_actions = np.full((max_length, num_action, eval_episodes), np.nan)
+    for i, actions in enumerate(action_set):
+        aligned_actions[:len(actions), :, i] = actions
+
+    mean_action_by_age = np.nanmean(aligned_actions, axis=2)
+    mean_actions = np.column_stack((unique_age, mean_action_by_age))
+    mean_actions_df = pd.DataFrame(mean_actions, 
+                                    columns=['年龄', '消费', '风险资产','个人养老金购买比例','个人养老金风险资产比例'])
+    mean_actions_path = eval_dir+ model_identifier + "//" + model_identifier + "_mean_actions.xlsx"
+    mean_actions_df.to_excel(mean_actions_path, index=False)
+
+
+  
+    # 在life_summary_df前面插入模型标识符列
+    life_summary_df.insert(0, '模型', model_identifier)
+    return life_summary_df
+    # print(f"模型{idx}评估完毕, 评估次数为{eval_episodes}")
+
+
+if __name__ == '__main__':
+
+
+    # 创建进程池
+    # pool = mp.Pool()
+    
+    # # 循环执行evaluate_model
+    from tqdm import tqdm
+    life_summary_naive = evaluate_model_naive(eval_episodes=eval_episodes, eval_seed=eval_seed)
+    life_summary_rl = []
+    for model_name in tqdm(rl_model_name, desc='总进度'):
+        result = evaluate_model_rl(model_name, eval_episodes=eval_episodes, eval_seed=eval_seed)
+        life_summary_rl.append(result)
+    life_summary = pd.concat([life_summary_naive, *life_summary_rl], ignore_index=True)
+    pd.set_option('display.float_format', lambda x: '{:.3f}'.format(x))
+    pd.set_option('display.colheader_justify', 'center')
+    pd.set_option('display.unicode.ambiguous_as_wide', True)
+    pd.set_option('display.unicode.east_asian_width', True)
+    print(life_summary.to_string(index=False))
+
+
